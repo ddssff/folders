@@ -11,22 +11,23 @@
 
 {-# LANGUAGE DeriveFunctor, ScopedTypeVariables #-}
 
-import Debug.Trace
+--import Debug.Trace
 import Control.Monad (when)
 import Control.Monad.Extra (partitionM)
-import qualified Data.ByteString.Lazy as BS (isPrefixOf, length, readFile)
-import Data.Digest.Pure.SHA
-import Data.Digest.Pure.MD5
+import qualified Data.ByteString.Lazy as BS (isPrefixOf, length)
+--import Data.Digest.Pure.SHA
+--import Data.Digest.Pure.MD5
 -- import Data.List (partition)
-import Data.Map.Strict as Map (elems, filter, fromListWith, keys, Map, map, partition, size, unionWith)
-import Data.Maybe (mapMaybe)
-import Data.Set as Set (empty, fromList, Set, singleton, size, toList, union, unions)
+import Data.Map.Strict as Map (fromListWith, keys, partition)
+--import Data.Maybe (mapMaybe)
+import Data.Set as Set (empty, Set, singleton, unions)
 import Find
 import Options.Applicative
-import System.Directory (canonicalizePath, getDirectoryContents)
-import System.Posix.Files (getSymbolicLinkStatus, isDirectory, isRegularFile, isSymbolicLink, modificationTime)
-import System.Environment (withArgs)
+import System.Directory (canonicalizePath)
+import System.Posix.Files (getSymbolicLinkStatus, modificationTime)
+--import System.Environment (withArgs)
 import System.FilePath ((</>), addTrailingPathSeparator)
+import Text.PrettyPrint.ANSI.Leijen (Doc, vcat, text)
 
 newtype Master a = Master a deriving (Show, Eq, Ord, Functor)
 newtype Slave a = Slave a deriving (Show, Eq, Ord, Functor)
@@ -35,12 +36,30 @@ newtype Slave a = Slave a deriving (Show, Eq, Ord, Functor)
 
 main :: IO ()
 main = do
-  Options verbose master slave <- execParser (info (options <**> helper) (fullDesc))
+  Options verbose master slave <- execParser (info (options <**> helper) (fullDesc <> progDescDoc (Just intro)))
   master' <- canonicalizePath master
   slave' <- canonicalizePath slave
   case slave' == master' of
     True -> error $ "Cannot compare a directory to itself: " ++ show master ++ ", " ++ show slave
     False -> go verbose master slave
+
+intro :: Doc
+intro =
+  vcat $ fmap text $
+    [ ""
+    , "This program performs a detailed comparison of two directories,"
+    , "somewhat arbitrarily labelled 'master' and 'slave'.  First it"
+    , "checks that the two paths do not refer to the same folder, either"
+    , "directly or indirectly via symbolic or hard links.  (It might be"
+    , "possible to fool this test using mount --bind.)  It collects information"
+    , "about all the regular files and subdirectories files in each file tree,"
+    , "(not following symbolic links.)  It then outputs a summary, which includes:"
+    , "   * the status of each distinct path in either tree, including whether"
+    , "     the file is missing from slave, missing from master, or present in both"
+    , "   * for files present in both tree, a set of relationship attributes are"
+    , "     computed describing whether the files differ, how their lengths differ,"
+    , "     whether either is a prefix of the other, and how their ages differ."
+    , ""]
 
 data Options = Options Bool FilePath FilePath
 

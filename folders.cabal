@@ -1,0 +1,34 @@
+name:               folders
+version:            0.1
+cabal-version:      >= 1.10
+build-type:         Simple
+license:            BSD3
+category:           System
+author:             David Fox
+copyright:          (c) David Fox
+maintainer:         David Fox <dsf@seereason.com>
+homepage:           https://github.com/ddssff/folders
+stability:          experimental
+synopsis:           Examine the contents folders, compare two folders
+
+library
+  default-language: Haskell2010
+  ghc-options: -Wall
+  hs-source-dirs: src
+  build-depends: base >= 4.8 && < 5, bytestring, containers, directory, filepath, pureMD5, unix
+  exposed-modules:
+    Find
+
+Executable compare
+  default-language: Haskell2010
+  main-is: Compare.hs
+  hs-source-dirs: tools
+  ghc-options: -Wall
+  build-depends: ansi-wl-pprint, base, bytestring, containers, directory, extra, filepath, folders, optparse-applicative, pureMD5, SHA, unix
+
+Executable duplicates
+  default-language: Haskell2010
+  main-is: Duplicates.hs
+  hs-source-dirs: tools
+  ghc-options: -Wall
+  build-depends: ansi-wl-pprint, base, bytestring, containers, directory, extra, filepath, folders, optparse-applicative, pureMD5, SHA, unix
