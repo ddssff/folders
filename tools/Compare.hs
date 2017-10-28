@@ -1,15 +1,15 @@
--- | Describe the relationship between two folders Master and Slave:
+-- | Describe the relationship between two folders Left and Right:
 --
 --      1. A and B are identical
---      2. A and B are identical except some files in Master are missing from Slave
---      3. A and B are identical except some files in Slave are missing from Master
+--      2. A and B are identical except some files in Left are missing from Right
+--      3. A and B are identical except some files in Right are missing from Left
 --      4. A and B are identical each have files missing from the other
 --      5. Some files common to A and B differ
 --
 -- Conditions 1 thru 4 are all mutually exclusive.  Condition 5 can
 -- accompany any of conditions 1 thru 4.
 
-{-# LANGUAGE DeriveFunctor, ScopedTypeVariables #-}
+{-# LANGUAGE CPP, DeriveFunctor, ScopedTypeVariables #-}
 
 --import Debug.Trace
 import Control.Monad (when)
@@ -17,45 +17,44 @@ import Control.Monad.Extra (partitionM)
 import qualified Data.ByteString.Lazy as BS (isPrefixOf, length)
 --import Data.Digest.Pure.SHA
 --import Data.Digest.Pure.MD5
--- import Data.List (partition)
-import Data.Map.Strict as Map (fromListWith, keys, partition)
+import Data.List (sort)
+import Data.Map.Strict as Map (fromListWith, keys, Map, null, partition)
 --import Data.Maybe (mapMaybe)
-import Data.Set as Set (empty, Set, singleton, unions)
+import Data.Set as Set (empty, member, notMember, Set, singleton, unions)
+import Data.Tree
 import Find
 import Options.Applicative
 import System.Directory (canonicalizePath)
+import System.IO (hPutStrLn, stderr)
 import System.Posix.Files (getSymbolicLinkStatus, modificationTime)
---import System.Environment (withArgs)
+import System.Environment (withArgs)
 import System.FilePath ((</>), addTrailingPathSeparator)
 import Text.PrettyPrint.ANSI.Leijen (Doc, vcat, text)
 
-newtype Master a = Master a deriving (Show, Eq, Ord, Functor)
-newtype Slave a = Slave a deriving (Show, Eq, Ord, Functor)
-
--- withArgs ["-v", "--master", "/mnt/sda2/srv/originals/mail/mail5", "--slave", "/mnt/sda2/srv/originals/mail/mail1"] main
+-- withArgs ["-v", "--left", "/mnt/sda2/srv/originals/mail/mail6/20051127", "--right", "/mnt/sda2/srv/originals/mail/mail6/20051226"] main
 
 main :: IO ()
 main = do
-  Options verbose master slave <- execParser (info (options <**> helper) (fullDesc <> progDescDoc (Just intro)))
-  master' <- canonicalizePath master
-  slave' <- canonicalizePath slave
-  case slave' == master' of
-    True -> error $ "Cannot compare a directory to itself: " ++ show master ++ ", " ++ show slave
-    False -> go verbose master slave
+  Options verbose left right <- execParser (info (options <**> helper) (fullDesc <> progDescDoc (Just intro)))
+  left' <- canonicalizePath left
+  right' <- canonicalizePath right
+  case right' == left' of
+    True -> error $ "Cannot compare a directory to itself: " ++ show left ++ ", " ++ show right
+    False -> go verbose left right
 
 intro :: Doc
 intro =
   vcat $ fmap text $
     [ ""
     , "This program performs a detailed comparison of two directories,"
-    , "somewhat arbitrarily labelled 'master' and 'slave'.  First it"
+    , "somewhat arbitrarily labelled 'left' and 'right'.  First it"
     , "checks that the two paths do not refer to the same folder, either"
     , "directly or indirectly via symbolic or hard links.  (It might be"
     , "possible to fool this test using mount --bind.)  It collects information"
     , "about all the regular files and subdirectories files in each file tree,"
     , "(not following symbolic links.)  It then outputs a summary, which includes:"
     , "   * the status of each distinct path in either tree, including whether"
-    , "     the file is missing from slave, missing from master, or present in both"
+    , "     the file is missing from right, missing from left, or present in both"
     , "   * for files present in both tree, a set of relationship attributes are"
     , "     computed describing whether the files differ, how their lengths differ,"
     , "     whether either is a prefix of the other, and how their ages differ."
@@ -65,31 +64,86 @@ data Options = Options Bool FilePath FilePath
 
 options :: Parser Options
 options = Options <$> switch (long "verbose" <> short 'v' <> help "Give progress messages")
-                  <*> strOption ( long "master" <> metavar "FOLDER" <> help "Master folder for comparison")
-                  <*> strOption ( long "slave" <> metavar "FOLDER" <> help "Slave folder for comparison")
+                  <*> strOption ( long "left" <> metavar "FOLDER" <> help "Left folder for comparison")
+                  <*> strOption ( long "right" <> metavar "FOLDER" <> help "Right folder for comparison")
+
+{- The idea of "folding" in haskell seems pretty straightforward - you
+   give it an a, and some functions to apply to the different pieces of
+   an a to make an r, and the fold applies the appropriate function or
+   functions to create a result:
+
+     foldr :: (a -> r -> r) -> r -> t a -> r
+
+   Unfolding, on the other hand, is much more slippery.  Presumably it
+   is the inverse operation to folding, so it takes a "result" r and
+   builds an a.  First problem is that the word "unfold" makes me think
+   of the exact opposite.  In my mind, the "unfold" operation for a tree
+   is going to give me something other than a tree.  But in Haskell world
+   doing a Tree unfold is what builds you a Tree.  So lets look:
+
+     unfoldTree :: (b -> (a, [b])) -> b -> Tree a
+     unfoldTreeM :: Monad m => (b -> m (a, [b])) -> b -> m (Tree a)
+
+   This is clearly going to turn a @b@ into a @Tree a@, and it is going to
+   use a function parameter that turns any @b@ into an @a@ (a node label) and
+   a list of @b@, which presumably represent the tree's children. -}
 
 go :: Bool -> FilePath -> FilePath -> IO ()
-go verbose master slave = do
-  when verbose $ putStrLn $ "Comparing folders: " ++ show master ++ " vs. " ++ show slave
-  (mpaths :: [FilePath]) <- getSubdirectoryFilesRecursive verbose master >>= {-makeChecksumMap verbose .-} return . fmap (drop (length (addTrailingPathSeparator master))) . filterRegular
-  (spaths :: [FilePath]) <- getSubdirectoryFilesRecursive verbose slave >>= {-makeChecksumMap verbose .-} return . fmap (drop (length (addTrailingPathSeparator slave))) . filterRegular
-  let mp = Map.fromListWith
+go verbose left right = do
+#if 1
+    -- Build a tree with comparative meta information
+    (tree :: Tree (FilePath, (Set FileAttribute, Set FileAttribute))) <-
+        zipFolderFiles verbose (\a b -> return (a, b)) left right
+    -- Get additional information where there are corresponding file
+    (tree' :: Tree (FilePath, Set FileComparison)) <-
+        unfoldTreeM (\(Node (path, (lattrs, rattrs)) subforest) ->
+                         if (Set.member Regular lattrs && Set.member Regular rattrs)
+                         then do
+                           lattrs' <- getDeeper verbose (left </> path) lattrs
+                           rattrs' <- getDeeper verbose (right </> path) rattrs
+                           when verbose (putStrLn ("lattrs' " ++ path ++ ": " ++ show lattrs'))
+                           when verbose (putStrLn ("rattrs' " ++ path ++ ": " ++ show rattrs'))
+                           let attrs = compareFiles lattrs' rattrs'
+                           when verbose (putStrLn ("attrs " ++ path ++ ": " ++ show attrs))
+                           return $ ((path, attrs), subforest)
+                         else return $ ((path, compareFiles lattrs rattrs), subforest)) tree
+    when verbose (putStrLn (show tree'))
+    let pairs = flatten tree'
+    putStrLn ("# files: " ++ show (length pairs))
+    putStrLn (unlines ("differing:" : fmap show (filter ((\s -> Set.member BothRegular s && Set.notMember Identical s) . snd) pairs)))
+    putStrLn ("left only: " ++ show (fmap fst (filter (Set.member LeftExistsOnly . snd) pairs)))
+    putStrLn ("right only: " ++ show (fmap fst (filter (Set.member RightExistsOnly . snd) pairs)))
+#else
+  when verbose $ putStrLn $ "Comparing folders: " ++ show left ++ " vs. " ++ show right
+  (mpaths :: [FilePath]) <- getSubdirectoryFilesRecursive verbose (getStatus verbose) id left >>=
+                            return . fmap (drop (length (addTrailingPathSeparator left))) . Map.keys . keepRegular
+  -- hPutStrLn stderr $ "# files in " ++ show left ++ ": " ++ show (length mpaths)
+  (spaths :: [FilePath]) <- getSubdirectoryFilesRecursive verbose (getStatus verbose) id right >>=
+                            return . fmap (drop (length (addTrailingPathSeparator right))) . Map.keys . keepRegular
+  -- hPutStrLn stderr $ "# files in " ++ show right ++ ": " ++ show (length spaths)
+  let mp :: Map FilePath (Bool, Bool)
+      mp = Map.fromListWith
              (\(ma, mb) (sa, sb) -> (ma || sa, mb || sb))
              (fmap (\p -> (p, (True, False))) mpaths ++
               fmap (\p -> (p, (False, True))) spaths)
+  -- Which files exist in both trees?
   let (common, other) = partition (\pr -> case pr of
                                             (True, True) -> True
                                             _ -> False) mp
-      (masterOnly, slaveOnly) = partition (\pr -> case pr of
+      (leftOnly, rightOnly) = partition (\pr -> case pr of
                                                     (True, False) -> True
                                                     (False, True) -> False) other
-  let masterOnly' = Map.keys masterOnly
-      slaveOnly' = Map.keys slaveOnly
+  let leftOnly' = Map.keys leftOnly
+      rightOnly' = Map.keys rightOnly
       common' = Map.keys common
-  (equal, differing) <- partitionM (\sub -> equalFiles (master </> sub) (slave </> sub)) common'
-  differing' <- zip differing <$> mapM (\sub -> compareFiles (master </> sub) (slave </> sub)) differing
-  putStrLn $ describeStatus master slave masterOnly' slaveOnly' equal differing'
-  putStrLn $ "status: " ++ show (status masterOnly' slaveOnly' equal differing')
+  putStrLn $ "# common: " ++ show (length common')
+  putStrLn $ "# non-common: " ++ show (length (leftOnly' ++ rightOnly'))
+  -- Compare common files
+  mp <- filePairInfoMap left right common'
+  hPutStrLn stderr "b"
+  let (equal, differing) = partition (Set.member Identical) mp
+  putStrLn $ describeStatus left right leftOnly' rightOnly' (Map.keys equal) differing
+  putStrLn $ "status: " ++ show (status leftOnly' rightOnly' (Map.keys equal) differing)
     where
       mf :: a -> (Maybe a, Maybe a)
       mf a = (Just a, Nothing)
@@ -98,63 +152,14 @@ go verbose master slave = do
       combineLeaf :: (Show a, Show b) => (Maybe a, Maybe b) -> (Maybe a, Maybe b) -> (Maybe a, Maybe b)
       combineLeaf (Just a, Nothing) (Nothing, Just b) = (Just a, Just b)
       combineLeaf a b = error $ "Unexpected arguments to combineLeaf: " ++ show (a,  b)
+#endif
 
--- | Comparing two files yields a set of these
-data FileComparison =
-    Identical
-  | Differing
-  | Longer
-  | Shorter
-  | SameLength
-  | HasPrefix -- Fun fact: HasPrefix && IsPrefix <=> Identical
-  | IsPrefix
-  | Newer
-  | SameAge
-  | Older
-  deriving (Show, Eq, Ord)
+filePairInfoMap :: FilePath -> FilePath -> [FilePath] -> IO (Map FilePath (Set FileComparison))
+filePairInfoMap ltop rtop files = undefined
 
-compareFiles :: FilePath -> FilePath -> IO (Set FileComparison)
-compareFiles m s = do
-  mstat <- getSymbolicLinkStatus m
-  sstat <- getSymbolicLinkStatus s
-  (mck, mbytes) <- fileChecksum m
-  (mck, sbytes) <- fileChecksum s
-  return $ Set.unions $ [doEquality mbytes sbytes,
-                         doLength mbytes sbytes,
-                         doPrefix mbytes sbytes,
-                         doAge mstat sstat]
-    where
-      doEquality mbytes sbytes =
-          case mbytes == sbytes of
-            True -> singleton Identical
-            False -> singleton Differing
-      doLength mbytes sbytes =
-          case compare (BS.length mbytes) (BS.length sbytes) of
-            LT -> singleton Shorter
-            EQ -> singleton SameLength
-            GT -> singleton Longer
-
-      doPrefix mbytes sbytes =
-          case (BS.isPrefixOf sbytes mbytes, BS.isPrefixOf mbytes sbytes) of
-            (True, True) -> Set.empty
-            (True, False) -> singleton HasPrefix
-            (False, True) -> singleton IsPrefix
-            (False, False) -> Set.empty
-      doAge mstat sstat = do
-        case compare (modificationTime mstat) (modificationTime sstat) of
-          LT -> singleton Older
-          EQ -> singleton SameAge
-          GT -> singleton Newer
-
-equalFiles :: FilePath -> FilePath -> IO Bool
-equalFiles a b = do
-  (ck1, _) <- fileChecksum a
-  (ck2, _) <- fileChecksum b
-  return (ck1 == ck2)
-
-status :: [FilePath] -> [FilePath] -> [FilePath] -> [(FilePath, Set FileComparison)] -> Int
-status masterOnly slaveOnly equal differing =
-    case (null masterOnly, null slaveOnly) of
+status :: [FilePath] -> [FilePath] -> [FilePath] -> Map FilePath (Set FileComparison) -> Int
+status leftOnly rightOnly equal differing =
+    case (Prelude.null leftOnly, Prelude.null rightOnly) of
       (True, True) -> 1
       (False, True) -> 2
       (True, False) -> 3
@@ -166,13 +171,13 @@ describeStatus ::
     -> [FilePath]
     -> [FilePath]
     -> [FilePath]
-    -> [(FilePath, Set FileComparison)]
+    -> Map FilePath (Set FileComparison)
     -> String
-describeStatus master slave masterOnly slaveOnly equal differing =
-    (if not (null differing) then unlines ("Common files differ:" : fmap show differing) else "") ++
-    (case status masterOnly slaveOnly equal differing of
+describeStatus left right leftOnly rightOnly equal differing =
+    (if not (Map.null differing) then unlines ("Common files differ:" : fmap show (sort (Map.keys differing))) else "") ++
+    (case status leftOnly rightOnly equal differing of
        1 -> "Folders file names are identical"
-       2 -> unlines $ ("Missing from slave " ++ show slave ++ ":") : fmap (("  " ++) . show) masterOnly
-       3 -> unlines $ ("Missing from master " ++ show master ++ ":") : fmap (("  " ++) . show) slaveOnly
-       4 -> unlines $ (("Missing from slave " ++ show slave ++ ":") : fmap (("  " ++) . show) masterOnly) ++
-                      (("Missing from master " ++ show master ++ ":") : fmap (("  " ++) . show) slaveOnly))
+       2 -> unlines $ ("Missing from right " ++ show right ++ ":") : fmap (("  " ++) . show) leftOnly
+       3 -> unlines $ ("Missing from left " ++ show left ++ ":") : fmap (("  " ++) . show) rightOnly
+       4 -> unlines $ (("Missing from right " ++ show right ++ ":") : fmap (("  " ++) . show) leftOnly) ++
+                      (("Missing from left " ++ show left ++ ":") : fmap (("  " ++) . show) rightOnly))

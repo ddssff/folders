@@ -1,2 +1,4 @@
-1. Too many open file descriptors bug
-
+ * 1. Too many open file descriptors bug
+   2. Omit missing files if they are in missing direcories
+   3. Detect when all files in a folder are duplicates
+   4. Find folders that seem to be versions of one another

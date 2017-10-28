@@ -15,7 +15,7 @@ library
   default-language: Haskell2010
   ghc-options: -Wall
   hs-source-dirs: src
-  build-depends: base >= 4.8 && < 5, bytestring, containers, directory, filepath, pureMD5, unix
+  build-depends: base >= 4.8 && < 5, bytestring, containers, data-default, directory, filepath, lens, mtl, pureMD5, unix
   exposed-modules:
     Find
 
