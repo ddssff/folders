@@ -5,29 +5,32 @@
 -- Features:
 --   (coming) Only read files when there are pairs with equal lengths
 
-{-# LANGUAGE FlexibleContexts, TupleSections #-}
+{-# LANGUAGE FlexibleContexts, ScopedTypeVariables, TupleSections #-}
 {-# OPTIONS -Wall #-}
 
 import Control.Monad (when)
-import Control.Monad.State (evalStateT)
+import Control.Monad.State (evalStateT, MonadState)
+import Control.Monad.Trans (liftIO, MonadIO)
 import Data.Default (def)
-import Data.Map.Strict as Map (elems, filter, Map, mapMaybe, size, unions)
+import Data.Map.Strict as Map (elems, filter, Map, size, unionsWith)
 import Data.Set as Set (Set, size, toList)
-import Find (FileAttribute, getStatusDeep, getSubdirectoryFilesRecursive, isRegular, makeChecksumMap, keepDuplicates, Sum, toSum)
+import Find (FileAttribute, getStatus, getSubdirectoryFilesRecursive, isRegular, keepDuplicates, makeChecksumMap, makeLengthMap, St, Sum, toSum)
 import Options.Applicative
 import System.Environment (withArgs)
 
 -- withArgs ["-v", "1", "--top", "/mnt/sda2/pCloudSync/Audio/Music/Johann Sebastian Bach"] main
 
 main :: IO ()
-main =
+main = do
+  opts <-
     execParser
       (info
          (options <**> helper)
          (fullDesc
           -- <> progDesc "Print a greeting for TARGET"
           -- <> header "hello - a test for optparse-applicative"
-         )) >>= go
+         ))
+  evalStateT (go opts) def
 
 data Options = Options [FilePath] Int
 
@@ -35,13 +38,15 @@ options :: Parser Options
 options = Options <$> some (strOption ( long "top" <> metavar "FOLDER" <> help "Top folder to search for duplicates"))
                   <*> option auto (long "verbosity" <> short 'v' <> help "Amount of progress messages" <> showDefault <> value 0 <> metavar "INT")
 
-go :: Options -> IO ()
+go :: (MonadIO m, MonadState St m) => Options -> m ()
 go (Options tops verbosity) = do
-  when (verbosity >= 1) (putStrLn $ "Searching for duplicate files in " ++ show tops)
-  trees <- flip evalStateT def $
-              mapM (\top -> Map.mapMaybe id <$> getSubdirectoryFilesRecursive verbosity (getStatusDeep verbosity) keep top) tops
-  let mp = makeChecksumMap verbosity (Map.unions trees)
-  reportDuplicates tops (keepDuplicates mp)
+  when (verbosity >= 1) (liftIO $ putStrLn $ "Searching for duplicate files in " ++ show tops)
+  (trees :: [Map FilePath (Set FileAttribute)]) <- flip evalStateT def $
+              mapM (\top -> getSubdirectoryFilesRecursive verbosity (getStatus verbosity) id top) tops
+  let tree = (Map.unionsWith (\_ _ -> error "unions") trees :: Map FilePath (Set FileAttribute))
+  let lmp = makeLengthMap verbosity tree
+  cmp <- makeChecksumMap verbosity tree lmp
+  liftIO $ reportDuplicates tops (keepDuplicates cmp)
 
 keep :: Set FileAttribute -> Maybe Sum
 keep s = if isRegular s then toSum s else Nothing

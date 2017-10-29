@@ -8,6 +8,7 @@ module Find
     , FileComparison(..)
     , zipFolderFiles
     , compareFiles
+    , makeLengthMap
     , makeChecksumMap
     , keepDuplicates
     , keepRegular
@@ -20,20 +21,21 @@ module Find
 
 import Control.Exception (throw, try)
 import Control.Monad (when)
-import Data.ByteString as BS (ByteString, isPrefixOf, length, readFile, take)
+import Data.ByteString as BS (ByteString, isPrefixOf, readFile, take)
 import Data.ByteString.Lazy (fromStrict)
 #if 0
 import Data.Digest.Pure.SHA
 #else
 import Data.Digest.Pure.MD5
 #endif
-import Data.Map.Strict as Map (filter, fromList, fromListWith, Map, size, toList)
+import Data.List (intercalate)
+import Data.Map.Strict as Map (elems, filter, fromList, fromListWith, lookup, Map, size, toList)
 import Data.Maybe (catMaybes, listToMaybe)
 import Data.Set as Set (empty, fromList, insert, map, member, Set, singleton, size, toList, union, unions)
 import Data.Tree
 import System.Directory (getDirectoryContents)
-import System.Posix.Files (getSymbolicLinkStatus, isDirectory, isRegularFile, isSymbolicLink, modificationTime)
-import System.Posix.Types (EpochTime)
+import System.Posix.Files (fileSize, getSymbolicLinkStatus, isDirectory, isRegularFile, isSymbolicLink, modificationTime)
+import System.Posix.Types (EpochTime, FileOffset)
 import System.FilePath ((</>))
 import System.IO (hPutStr, stderr)
 import System.IO.Error (isDoesNotExistError)
@@ -61,6 +63,7 @@ data FileAttribute
     | Other
     -- These should be computed only if necessary, and removed from the
     -- Set ASAP to avoid using vast amounts of RAM.
+    | Length FileOffset
     | ModTime EpochTime
     | Bytes ByteString
     -- | Checksum Sum
@@ -73,6 +76,7 @@ instance Show FileAttribute where
   show Folder = "Folder"
   show Link = "Link"
   show Other = "Other"
+  show (Length l) = "Length " ++ show l
   show (ModTime t) = "ModTime " ++ show t
   show (Bytes bs) = "Bytes " ++ show (BS.take 20 bs)
   -- show (Checksum ck) = "Checksum " ++ show ck
@@ -136,7 +140,7 @@ listDirectory path = Prelude.filter (`notElem` [".", ".."]) <$> liftIO (getDirec
 getStatus :: (MonadIO m, MonadState St m) => Int -> FilePath -> m (Set FileAttribute)
 getStatus _verbosity path = do
   estat <- liftIO $ try (getSymbolicLinkStatus path)
-  doDots "stats" statCount
+  doDots 1000 "stats" statCount
   case estat of
     Left e | isDoesNotExistError e -> return $ singleton Nonexistant
     Left e -> throw e
@@ -144,7 +148,7 @@ getStatus _verbosity path = do
       case (isSymbolicLink stat, isDirectory stat, isRegularFile stat) of
         (True, _, _) -> return $ singleton Link
         (_, True, _) -> return $ singleton Folder
-        (_, _, True) -> return $ Set.fromList [Regular, ModTime (modificationTime stat)]
+        (_, _, True) -> return $ Set.fromList [Regular, ModTime (modificationTime stat), Length (fileSize stat)]
         _ -> return $ singleton Other
 
 -- | In addition to 'getStatus' result retrieve the file's content as a 'ByteString'.
@@ -155,16 +159,16 @@ getStatusDeep verbosity path = getStatus verbosity path >>= getDeeper verbosity 
 getDeeper :: (MonadIO m, MonadState St m) => Int -> FilePath -> (Set FileAttribute) -> m (Set FileAttribute)
 getDeeper _verbosity path attrs = do
   content <- liftIO $ try (BS.readFile path)
-  doDots "reads" readCount
+  doDots 100 "reads" readCount
   return $ either (\(_ :: IOError) -> Set.insert Unreadable attrs)
                   (\bytes -> Set.insert (Bytes bytes) ({-Set.insert (Checksum ck)-} attrs))
                   content
 
-doDots :: (MonadIO m, MonadState St m) => String -> Lens' St Int -> m ()
-doDots s l = do
+doDots :: (MonadIO m, MonadState St m) => Int -> String -> Lens' St Int -> m ()
+doDots c s l = do
   l %= succ
   n <- use l
-  when (n `mod` 100 == 0) (liftIO $ hPutStr stderr (show n ++ " " ++ s ++ "..."))
+  when (n `mod` c == 0) (liftIO $ hPutStr stderr (show n ++ " " ++ s ++ "..."))
 
 getSubdirectoryFilesRecursive ::
     forall m a. (MonadIO m, MonadState St m, Show a)
@@ -192,11 +196,39 @@ getSubdirectoryFilesRecursive verbosity get f top =
           True -> (fmap (path </>) . Prelude.filter (`notElem` [".", ".."])) <$> liftIO (getDirectoryContents path)
           False -> return []
 
-makeChecksumMap :: Int -> Map FilePath Sum -> Map Sum (Set FilePath)
-makeChecksumMap _verbosity paths =
-    Map.fromListWith union $ fmap toPair $ Map.toList paths
+makeChecksumMap ::
+    forall m. (MonadIO m, MonadState St m)
+    => Int
+    -> Map FilePath (Set FileAttribute)
+    -> Map FileOffset (Set FilePath)
+    -> m (Map Sum (Set FilePath))
+makeChecksumMap verbosity attrmap lengthmap = do
+  when (verbosity >= 1) $ do
+    liftIO $ putStrLn $
+      "Number of files to compare: " ++ show (Set.size (unions (elems lengthmap'))) ++
+      "\n total size: " ++ show (sum (fmap (\(l, s) -> l * toEnum (Set.size s)) (Map.toList lengthmap')))
+  when (verbosity >= 2) $ liftIO $ putStrLn $ "\n size groups: " ++ intercalate "\n  " sizeGroups
+  Map.fromList <$> mapM getSum paths
     where
-      toPair (path, ck) = (ck, singleton path)
+      sizeGroups :: [String]
+      sizeGroups = fmap (\(l, s) -> intercalate "\n   " ((show l ++ ":") : Set.toList s)) (Map.toList lengthmap')
+      paths :: [FilePath]
+      paths = Set.toList (Set.unions (Map.elems lengthmap'))
+      getSum :: FilePath -> m (Sum, Set FilePath)
+      getSum path = do
+        attrs' <- case Map.lookup path attrmap of
+                    Just attrs -> getDeeper verbosity path attrs
+                    Nothing -> error $ "makeChecksumMap - missing from attrmap: " ++ show path
+        let (Just ck) = toSum attrs'
+        return (ck, singleton path)
+      lengthmap' :: Map FileOffset (Set FilePath)
+      lengthmap' = Map.filter (\s -> Set.size s > 1) lengthmap
+
+makeLengthMap :: Int -> Map FilePath (Set FileAttribute) -> Map FileOffset (Set FilePath)
+makeLengthMap _verbosity attrmap =
+    Map.fromListWith union $ concatMap toPair $ Map.toList attrmap
+    where
+      toPair (path, attrs) = maybe [] (\l -> [(l, singleton path)]) (toLength attrs)
 
 -- | Remove files that have no duplicates
 keepDuplicates :: forall k. Ord k => Map k (Set FilePath) -> Map k (Set FilePath)
@@ -226,10 +258,12 @@ toBytes :: Set FileAttribute -> Maybe ByteString
 toBytes = listToMaybe . catMaybes . Set.toList . Set.map (\x -> case x of Bytes b -> Just b; _ -> Nothing)
 toModTime :: Set FileAttribute -> Maybe EpochTime
 toModTime = listToMaybe . catMaybes . Set.toList . Set.map (\x -> case x of ModTime t -> Just t; _ -> Nothing)
+toLength :: Set FileAttribute -> Maybe FileOffset
+toLength = listToMaybe . catMaybes . Set.toList . Set.map (\x -> case x of Length t -> Just t; _ -> Nothing)
+-- toLength :: Set FileAttribute -> Maybe Int
+-- toLength = fmap BS.length . toBytes
 toSum :: Set FileAttribute -> Maybe Sum
 toSum = fmap checksum . toBytes
-toLength :: Set FileAttribute -> Maybe Int
-toLength = fmap BS.length . toBytes
 
 compareFiles :: Set FileAttribute -> Set FileAttribute -> Set FileComparison
 compareFiles lattrs rattrs =
