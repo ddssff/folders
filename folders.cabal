@@ -24,11 +24,11 @@ Executable compare
   main-is: Compare.hs
   hs-source-dirs: tools
   ghc-options: -Wall
-  build-depends: ansi-wl-pprint, base, bytestring, containers, directory, extra, filepath, folders, optparse-applicative, pureMD5, SHA, unix
+  build-depends: ansi-wl-pprint, base, bytestring, containers, data-default, directory, extra, filepath, folders, mtl, optparse-applicative, pureMD5, SHA, unix
 
 Executable duplicates
   default-language: Haskell2010
   main-is: Duplicates.hs
   hs-source-dirs: tools
   ghc-options: -Wall
-  build-depends: ansi-wl-pprint, base, bytestring, containers, directory, extra, filepath, folders, optparse-applicative, pureMD5, SHA, unix
+  build-depends: ansi-wl-pprint, base, bytestring, containers, data-default, directory, extra, filepath, folders, mtl, optparse-applicative, pureMD5, SHA, unix

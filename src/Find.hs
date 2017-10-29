@@ -2,7 +2,8 @@
 {-# OPTIONS -Wall #-}
 
 module Find
-    ( Sum
+    ( St(..)
+    , Sum
     , FileAttribute(..), toSum, isRegular
     , FileComparison(..)
     , zipFolderFiles
@@ -34,12 +35,22 @@ import System.Directory (getDirectoryContents)
 import System.Posix.Files (getSymbolicLinkStatus, isDirectory, isRegularFile, isSymbolicLink, modificationTime)
 import System.Posix.Types (EpochTime)
 import System.FilePath ((</>))
--- import System.IO (hPutStr, stderr)
+import System.IO (hPutStr, stderr)
 import System.IO.Error (isDoesNotExistError)
 -- import System.Posix (FileStatus)
 -- import System.Posix.Types (EpochTime)
 
 -- data FileType = Regular | Folder | Link | Other deriving (Show, Eq, Ord)
+
+import Control.Lens (makeLenses, (%=), Lens', use)
+import Control.Monad.State (MonadState)
+import Control.Monad.Trans (liftIO, MonadIO)
+import Data.Default
+
+data St = St {_statCount :: Int, _readCount :: Int} deriving (Eq, Ord, Show)
+$(makeLenses ''St)
+
+instance Default St where def = St 0 0
 
 data FileAttribute
     = Nonexistant
@@ -92,19 +103,22 @@ checksum = md5 . fromStrict
 -- | Traverse two folders and collect information about the
 -- corresponding files at corresponding subpaths.
 zipFolderFiles ::
-       Bool
-    -> (Set FileAttribute -> Set FileAttribute -> IO a)
+       (MonadIO m, MonadState St m)
+    => Int
+    -> (Set FileAttribute -> Set FileAttribute -> m a)
     -> FilePath
     -> FilePath
-    -> IO (Tree (FilePath, a))
-zipFolderFiles verbose fn ltop rtop =
+    -> m (Tree (FilePath, a))
+zipFolderFiles verbosity fn ltop rtop =
     work ""
     where
       work sub = do
-        lattrs <- getStatus verbose (ltop </> sub)
-        rattrs <- getStatus verbose (rtop </> sub)
-        when verbose $ putStrLn ("lattrs " ++ sub ++ ": " ++ show lattrs)
-        when verbose $ putStrLn ("rattrs " ++ sub ++ ": " ++ show rattrs)
+        lattrs <- getStatus verbosity (ltop </> sub)
+        rattrs <- getStatus verbosity (rtop </> sub)
+        when (verbosity >= 2) $ do
+          liftIO $ do
+            putStrLn ("lattrs " ++ sub ++ ": " ++ show lattrs)
+            putStrLn ("rattrs " ++ sub ++ ": " ++ show rattrs)
         sf <- case (Set.member Folder lattrs, Set.member Folder rattrs) of
           (True, True) -> do
             (lsubs :: Set FilePath) <- (Set.fromList . fmap (sub </>)) <$> listDirectory (ltop </> sub)
@@ -115,13 +129,14 @@ zipFolderFiles verbose fn ltop rtop =
         a <- fn lattrs rattrs
         return $ Node (sub, a) sf
 
-listDirectory :: FilePath -> IO [FilePath]
-listDirectory path = Prelude.filter (`notElem` [".", ".."]) <$> getDirectoryContents path
+listDirectory :: (MonadIO m, MonadState St m) => FilePath -> m [FilePath]
+listDirectory path = Prelude.filter (`notElem` [".", ".."]) <$> liftIO (getDirectoryContents path)
 
 -- | Retrieve meta information about a file.
-getStatus :: Bool -> FilePath -> IO (Set FileAttribute)
-getStatus _verbose path = do
-  estat <- try (getSymbolicLinkStatus path)
+getStatus :: (MonadIO m, MonadState St m) => Int -> FilePath -> m (Set FileAttribute)
+getStatus _verbosity path = do
+  estat <- liftIO $ try (getSymbolicLinkStatus path)
+  doDots "stats" statCount
   case estat of
     Left e | isDoesNotExistError e -> return $ singleton Nonexistant
     Left e -> throw e
@@ -133,45 +148,52 @@ getStatus _verbose path = do
         _ -> return $ singleton Other
 
 -- | In addition to 'getStatus' result retrieve the file's content as a 'ByteString'.
-getStatusDeep :: Bool -> FilePath -> IO (Set FileAttribute)
-getStatusDeep verbose path = getStatus verbose path >>= getDeeper verbose path
+getStatusDeep :: (MonadIO m, MonadState St m) => Int -> FilePath -> m (Set FileAttribute)
+getStatusDeep verbosity path = getStatus verbosity path >>= getDeeper verbosity path
 
 -- | Add deep status information to a file's set of meta information.
-getDeeper :: Bool -> FilePath -> (Set FileAttribute) -> IO (Set FileAttribute)
-getDeeper _verbose path attrs = do
-  content <- try (BS.readFile path)
+getDeeper :: (MonadIO m, MonadState St m) => Int -> FilePath -> (Set FileAttribute) -> m (Set FileAttribute)
+getDeeper _verbosity path attrs = do
+  content <- liftIO $ try (BS.readFile path)
+  doDots "reads" readCount
   return $ either (\(_ :: IOError) -> Set.insert Unreadable attrs)
                   (\bytes -> Set.insert (Bytes bytes) ({-Set.insert (Checksum ck)-} attrs))
                   content
 
+doDots :: (MonadIO m, MonadState St m) => String -> Lens' St Int -> m ()
+doDots s l = do
+  l %= succ
+  n <- use l
+  when (n `mod` 100 == 0) (liftIO $ hPutStr stderr (show n ++ " " ++ s ++ "..."))
+
 getSubdirectoryFilesRecursive ::
-    forall a. Show a
-    => Bool
-    -> (FilePath -> IO (Set FileAttribute)) -- ^ Must at least determine if path is a 'Folder'
+    forall m a. (MonadIO m, MonadState St m, Show a)
+    => Int
+    -> (FilePath -> m (Set FileAttribute)) -- ^ Must at least determine if path is a 'Folder'
     -> (Set FileAttribute -> a)
     -> FilePath
-    -> IO (Map FilePath a)
-getSubdirectoryFilesRecursive verbose get f top =
-    (Map.fromList <$> getSubdirectoryFilesRecursive' top) >>= r1
+    -> m (Map FilePath a)
+getSubdirectoryFilesRecursive verbosity get f top =
+    Map.fromList <$> getSubdirectoryFilesRecursive' top >>= r1
     where
-      r1 mp = when verbose (putStrLn ("getSubdirectoryFilesRecursive - found " ++ show (Map.size mp) ++ " files")) >> return mp
+      r1 mp = when (verbosity >= 1) (liftIO $ putStrLn ("getSubdirectoryFilesRecursive - found " ++ show (Map.size mp) ++ " files")) >> return mp
 
-      getSubdirectoryFilesRecursive' :: FilePath -> IO [(FilePath, a)]
+      getSubdirectoryFilesRecursive' :: (MonadIO m, MonadState St m) => FilePath -> m [(FilePath, a)]
       getSubdirectoryFilesRecursive' path = do
-        when verbose $ putStrLn ("  " ++ path)
+        when (verbosity >= 2) $ liftIO $ putStrLn ("  " ++ path)
         attrs <- get path
         subpaths <- getSubdirectoryFiles path attrs
         subfiles <- concat <$> mapM (getSubdirectoryFilesRecursive') subpaths
         return $ (path, f attrs) : subfiles
 
-      getSubdirectoryFiles :: FilePath -> Set FileAttribute -> IO [FilePath]
+      getSubdirectoryFiles :: (MonadIO m, MonadState St m) => FilePath -> Set FileAttribute -> m [FilePath]
       getSubdirectoryFiles path attrs = do
         case Set.member Folder attrs of
-          True -> (fmap (path </>) . Prelude.filter (`notElem` [".", ".."])) <$> getDirectoryContents path
+          True -> (fmap (path </>) . Prelude.filter (`notElem` [".", ".."])) <$> liftIO (getDirectoryContents path)
           False -> return []
 
-makeChecksumMap :: Bool -> Map FilePath Sum -> Map Sum (Set FilePath)
-makeChecksumMap _verbose paths =
+makeChecksumMap :: Int -> Map FilePath Sum -> Map Sum (Set FilePath)
+makeChecksumMap _verbosity paths =
     Map.fromListWith union $ fmap toPair $ Map.toList paths
     where
       toPair (path, ck) = (ck, singleton path)

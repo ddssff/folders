@@ -8,30 +8,27 @@
 --
 -- Conditions 1 thru 4 are all mutually exclusive.  Condition 5 can
 -- accompany any of conditions 1 thru 4.
+--
+-- Features:
+--   * Only looks at contents when file exists in both trees.  So comparing
+--     an enormous file tree to a reasonable size file tree is feasable.
 
-{-# LANGUAGE CPP, DeriveFunctor, ScopedTypeVariables #-}
+{-# LANGUAGE CPP, DeriveFunctor, FlexibleContexts, ScopedTypeVariables #-}
 
---import Debug.Trace
 import Control.Monad (when)
-import Control.Monad.Extra (partitionM)
-import qualified Data.ByteString.Lazy as BS (isPrefixOf, length)
---import Data.Digest.Pure.SHA
---import Data.Digest.Pure.MD5
-import Data.List (sort)
-import Data.Map.Strict as Map (fromListWith, keys, Map, null, partition)
---import Data.Maybe (mapMaybe)
-import Data.Set as Set (empty, member, notMember, Set, singleton, unions)
+import Control.Monad.State (evalStateT, MonadState)
+import Control.Monad.Trans (liftIO, MonadIO)
+import Data.Default (def)
+import Data.Set as Set (member, notMember, Set)
 import Data.Tree
 import Find
 import Options.Applicative
 import System.Directory (canonicalizePath)
-import System.IO (hPutStrLn, stderr)
-import System.Posix.Files (getSymbolicLinkStatus, modificationTime)
 import System.Environment (withArgs)
-import System.FilePath ((</>), addTrailingPathSeparator)
+import System.FilePath ((</>))
 import Text.PrettyPrint.ANSI.Leijen (Doc, vcat, text)
 
--- withArgs ["-v", "--left", "/mnt/sda2/srv/originals/mail/mail6/20051127", "--right", "/mnt/sda2/srv/originals/mail/mail6/20051226"] main
+-- withArgs ["-v", "1", "--left", "/mnt/sda2/pCloudSync/Audio/Music/Akon", "--right", "/mnt/sda2/srv/originals/audio/iTunes Music"] main
 
 main :: IO ()
 main = do
@@ -40,7 +37,7 @@ main = do
   right' <- canonicalizePath right
   case right' == left' of
     True -> error $ "Cannot compare a directory to itself: " ++ show left ++ ", " ++ show right
-    False -> go verbose left right
+    False -> evalStateT (go verbose left right) def
 
 intro :: Doc
 intro =
@@ -60,10 +57,10 @@ intro =
     , "     whether either is a prefix of the other, and how their ages differ."
     , ""]
 
-data Options = Options Bool FilePath FilePath
+data Options = Options Int FilePath FilePath
 
 options :: Parser Options
-options = Options <$> switch (long "verbose" <> short 'v' <> help "Give progress messages")
+options = Options <$> option auto (long "verbosity" <> short 'v' <> help "Amount of progress messages" <> showDefault <> value 0 <> metavar "INT")
                   <*> strOption ( long "left" <> metavar "FOLDER" <> help "Left folder for comparison")
                   <*> strOption ( long "right" <> metavar "FOLDER" <> help "Right folder for comparison")
 
@@ -88,31 +85,32 @@ options = Options <$> switch (long "verbose" <> short 'v' <> help "Give progress
    use a function parameter that turns any @b@ into an @a@ (a node label) and
    a list of @b@, which presumably represent the tree's children. -}
 
-go :: Bool -> FilePath -> FilePath -> IO ()
-go verbose left right = do
+go :: (MonadIO m, MonadState St m) => Int -> FilePath -> FilePath -> m ()
+go verbosity left right = do
 #if 1
     -- Build a tree with comparative meta information
     (tree :: Tree (FilePath, (Set FileAttribute, Set FileAttribute))) <-
-        zipFolderFiles verbose (\a b -> return (a, b)) left right
+        zipFolderFiles verbosity (\a b -> return (a, b)) left right
     -- Get additional information where there are corresponding file
     (tree' :: Tree (FilePath, Set FileComparison)) <-
         unfoldTreeM (\(Node (path, (lattrs, rattrs)) subforest) ->
                          if (Set.member Regular lattrs && Set.member Regular rattrs)
                          then do
-                           lattrs' <- getDeeper verbose (left </> path) lattrs
-                           rattrs' <- getDeeper verbose (right </> path) rattrs
-                           when verbose (putStrLn ("lattrs' " ++ path ++ ": " ++ show lattrs'))
-                           when verbose (putStrLn ("rattrs' " ++ path ++ ": " ++ show rattrs'))
+                           lattrs' <- getDeeper verbosity (left </> path) lattrs
+                           rattrs' <- getDeeper verbosity (right </> path) rattrs
+                           when (verbosity >= 2) (liftIO $ putStrLn ("lattrs' " ++ path ++ ": " ++ show lattrs'))
+                           when (verbosity >= 2) (liftIO $ putStrLn ("rattrs' " ++ path ++ ": " ++ show rattrs'))
                            let attrs = compareFiles lattrs' rattrs'
-                           when verbose (putStrLn ("attrs " ++ path ++ ": " ++ show attrs))
+                           when (verbosity >= 2) (liftIO $ putStrLn ("attrs " ++ path ++ ": " ++ show attrs))
                            return $ ((path, attrs), subforest)
                          else return $ ((path, compareFiles lattrs rattrs), subforest)) tree
-    when verbose (putStrLn (show tree'))
+    when (verbosity >= 3) (liftIO $ putStrLn (show tree'))
     let pairs = flatten tree'
-    putStrLn ("# files: " ++ show (length pairs))
-    putStrLn (unlines ("differing:" : fmap show (filter ((\s -> Set.member BothRegular s && Set.notMember Identical s) . snd) pairs)))
-    putStrLn ("left only: " ++ show (fmap fst (filter (Set.member LeftExistsOnly . snd) pairs)))
-    putStrLn ("right only: " ++ show (fmap fst (filter (Set.member RightExistsOnly . snd) pairs)))
+    liftIO $ do
+      putStrLn ("# files: " ++ show (length pairs))
+      putStrLn (unlines ("differing:" : fmap show (filter ((\s -> Set.member BothRegular s && Set.notMember Identical s) . snd) pairs)))
+      putStrLn ("left only: " ++ show (fmap fst (filter (Set.member LeftExistsOnly . snd) pairs)))
+      putStrLn ("right only: " ++ show (fmap fst (filter (Set.member RightExistsOnly . snd) pairs)))
 #else
   when verbose $ putStrLn $ "Comparing folders: " ++ show left ++ " vs. " ++ show right
   (mpaths :: [FilePath]) <- getSubdirectoryFilesRecursive verbose (getStatus verbose) id left >>=
@@ -154,9 +152,7 @@ go verbose left right = do
       combineLeaf a b = error $ "Unexpected arguments to combineLeaf: " ++ show (a,  b)
 #endif
 
-filePairInfoMap :: FilePath -> FilePath -> [FilePath] -> IO (Map FilePath (Set FileComparison))
-filePairInfoMap ltop rtop files = undefined
-
+#if 0
 status :: [FilePath] -> [FilePath] -> [FilePath] -> Map FilePath (Set FileComparison) -> Int
 status leftOnly rightOnly equal differing =
     case (Prelude.null leftOnly, Prelude.null rightOnly) of
@@ -181,3 +177,4 @@ describeStatus left right leftOnly rightOnly equal differing =
        3 -> unlines $ ("Missing from left " ++ show left ++ ":") : fmap (("  " ++) . show) rightOnly
        4 -> unlines $ (("Missing from right " ++ show right ++ ":") : fmap (("  " ++) . show) leftOnly) ++
                       (("Missing from left " ++ show left ++ ":") : fmap (("  " ++) . show) rightOnly))
+#endif
