@@ -29,7 +29,7 @@ import Data.Digest.Pure.SHA
 import Data.Digest.Pure.MD5
 #endif
 import Data.List (intercalate)
-import Data.Map.Strict as Map (elems, filter, fromList, fromListWith, lookup, Map, size, toList)
+import Data.Map.Strict as Map (delete, elems, filter, fromList, fromListWith, lookup, Map, size, toList)
 import Data.Maybe (catMaybes, listToMaybe)
 import Data.Set as Set (empty, fromList, insert, map, member, Set, singleton, size, toList, union, unions)
 import Data.Tree
@@ -140,7 +140,7 @@ listDirectory path = Prelude.filter (`notElem` [".", ".."]) <$> liftIO (getDirec
 getStatus :: (MonadIO m, MonadState St m) => Int -> FilePath -> m (Set FileAttribute)
 getStatus _verbosity path = do
   estat <- liftIO $ try (getSymbolicLinkStatus path)
-  doDots 1000 "stats" statCount
+  doDots 10000 "stats" statCount
   case estat of
     Left e | isDoesNotExistError e -> return $ singleton Nonexistant
     Left e -> throw e
@@ -159,7 +159,7 @@ getStatusDeep verbosity path = getStatus verbosity path >>= getDeeper verbosity 
 getDeeper :: (MonadIO m, MonadState St m) => Int -> FilePath -> (Set FileAttribute) -> m (Set FileAttribute)
 getDeeper _verbosity path attrs = do
   content <- liftIO $ try (BS.readFile path)
-  doDots 100 "reads" readCount
+  doDots 1000 "reads" readCount
   return $ either (\(_ :: IOError) -> Set.insert Unreadable attrs)
                   (\bytes -> Set.insert (Bytes bytes) ({-Set.insert (Checksum ck)-} attrs))
                   content
@@ -201,26 +201,27 @@ makeChecksumMap ::
     => Int
     -> Map FilePath (Set FileAttribute)
     -> Map FileOffset (Set FilePath)
-    -> m (Map Sum (Set FilePath))
+    -> m (Map (Maybe Sum) (Set FilePath))
 makeChecksumMap verbosity attrmap lengthmap = do
   when (verbosity >= 1) $ do
     liftIO $ putStrLn $
       "Number of files to compare: " ++ show (Set.size (unions (elems lengthmap'))) ++
       "\n total size: " ++ show (sum (fmap (\(l, s) -> l * toEnum (Set.size s)) (Map.toList lengthmap')))
-  when (verbosity >= 2) $ liftIO $ putStrLn $ "\n size groups: " ++ intercalate "\n  " sizeGroups
+  when (verbosity >= 2) $ do
+    maybe (return ()) (\s -> liftIO $ putStrLn $ " # zero length files: " ++ show (Set.size s)) (Map.lookup 0 lengthmap')
+    liftIO $ putStrLn $ "\n size groups: " ++ intercalate "\n  " sizeGroups
   Map.fromList <$> mapM getSum paths
     where
       sizeGroups :: [String]
-      sizeGroups = fmap (\(l, s) -> intercalate "\n   " ((show l ++ ":") : Set.toList s)) (Map.toList lengthmap')
+      sizeGroups = fmap (\(l, s) -> intercalate "\n   " ((show l ++ ":") : Set.toList s)) (Map.toList (Map.delete 0 lengthmap'))
       paths :: [FilePath]
       paths = Set.toList (Set.unions (Map.elems lengthmap'))
-      getSum :: FilePath -> m (Sum, Set FilePath)
+      getSum :: FilePath -> m (Maybe Sum, Set FilePath)
       getSum path = do
         attrs' <- case Map.lookup path attrmap of
                     Just attrs -> getDeeper verbosity path attrs
                     Nothing -> error $ "makeChecksumMap - missing from attrmap: " ++ show path
-        let (Just ck) = toSum attrs'
-        return (ck, singleton path)
+        return $ (toSum attrs', singleton path)
       lengthmap' :: Map FileOffset (Set FilePath)
       lengthmap' = Map.filter (\s -> Set.size s > 1) lengthmap
 

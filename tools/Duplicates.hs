@@ -12,7 +12,8 @@ import Control.Monad (when)
 import Control.Monad.State (evalStateT, MonadState)
 import Control.Monad.Trans (liftIO, MonadIO)
 import Data.Default (def)
-import Data.Map.Strict as Map (elems, filter, Map, size, unionsWith)
+import Data.List (intercalate)
+import Data.Map.Strict as Map (delete, elems, filter, lookup, Map, size, unionsWith)
 import Data.Set as Set (Set, size, toList)
 import Find (FileAttribute, getStatus, getSubdirectoryFilesRecursive, isRegular, keepDuplicates, makeChecksumMap, makeLengthMap, St, Sum, toSum)
 import Options.Applicative
@@ -51,12 +52,15 @@ go (Options tops verbosity) = do
 keep :: Set FileAttribute -> Maybe Sum
 keep s = if isRegular s then toSum s else Nothing
 
-reportDuplicates :: [FilePath] -> Map Sum (Set FilePath) -> IO ()
-reportDuplicates tops mp = do
+reportDuplicates :: [FilePath] -> Map (Maybe Sum) (Set FilePath) -> IO ()
+reportDuplicates tops mp0 = do
   case Map.size mp of
     0 -> putStrLn ("No duplicates found inside " ++ show tops)
     n -> putStr (show n ++ " sets of duplicates found in " ++ show tops ++ " -\n" ++ unlines messages)
+  maybe (return ()) (\s -> putStrLn (intercalate "\n " ("File whose checksums could not be computed:" : Set.toList s))) nosums
     where
+      nosums = Map.lookup Nothing mp0
+      mp = Map.delete Nothing mp0
       messages :: [String]
       messages = fmap dupMessage dups
       dups :: [Set FilePath]

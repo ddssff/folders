@@ -13,8 +13,9 @@
 --   * Only looks at contents when file exists in both trees.  So comparing
 --     an enormous file tree to a reasonable size file tree is feasable.
 
-{-# LANGUAGE CPP, DeriveFunctor, FlexibleContexts, ScopedTypeVariables #-}
+{-# LANGUAGE CPP, DeriveFunctor, FlexibleContexts, ScopedTypeVariables, TemplateHaskell #-}
 
+import Control.Lens (makeLenses, view)
 import Control.Monad (when)
 import Control.Monad.State (evalStateT, MonadState)
 import Control.Monad.Trans (liftIO, MonadIO)
@@ -28,16 +29,20 @@ import System.Environment (withArgs)
 import System.FilePath ((</>))
 import Text.PrettyPrint.ANSI.Leijen (Doc, vcat, text)
 
+data Options = Options {_verbosity :: Int, _left :: FilePath, _right :: FilePath} deriving (Show, Eq, Ord)
+
+$(makeLenses ''Options)
+
 -- withArgs ["-v", "1", "--left", "/mnt/sda2/pCloudSync/Audio/Music/Akon", "--right", "/mnt/sda2/srv/originals/audio/iTunes Music"] main
 
 main :: IO ()
 main = do
-  Options verbose left right <- execParser (info (options <**> helper) (fullDesc <> progDescDoc (Just intro)))
-  left' <- canonicalizePath left
-  right' <- canonicalizePath right
+  opts <- execParser (info (options <**> helper) (fullDesc <> progDescDoc (Just intro)))
+  left' <- canonicalizePath (view left opts)
+  right' <- canonicalizePath (view right opts)
   case right' == left' of
-    True -> error $ "Cannot compare a directory to itself: " ++ show left ++ ", " ++ show right
-    False -> evalStateT (go verbose left right) def
+    True -> error $ "Cannot compare a directory to itself: " ++ show (view left opts) ++ ", " ++ show (view right opts)
+    False -> evalStateT (go opts) def
 
 intro :: Doc
 intro =
@@ -57,12 +62,10 @@ intro =
     , "     whether either is a prefix of the other, and how their ages differ."
     , ""]
 
-data Options = Options Int FilePath FilePath
-
 options :: Parser Options
 options = Options <$> option auto (long "verbosity" <> short 'v' <> help "Amount of progress messages" <> showDefault <> value 0 <> metavar "INT")
-                  <*> strOption ( long "left" <> metavar "FOLDER" <> help "Left folder for comparison")
-                  <*> strOption ( long "right" <> metavar "FOLDER" <> help "Right folder for comparison")
+                  <*> strOption (long "left" <> metavar "FOLDER" <> help "Left folder for comparison")
+                  <*> strOption (long "right" <> metavar "FOLDER" <> help "Right folder for comparison")
 
 {- The idea of "folding" in haskell seems pretty straightforward - you
    give it an a, and some functions to apply to the different pieces of
@@ -85,26 +88,29 @@ options = Options <$> option auto (long "verbosity" <> short 'v' <> help "Amount
    use a function parameter that turns any @b@ into an @a@ (a node label) and
    a list of @b@, which presumably represent the tree's children. -}
 
-go :: (MonadIO m, MonadState St m) => Int -> FilePath -> FilePath -> m ()
-go verbosity left right = do
+go :: (MonadIO m, MonadState St m) => Options -> m ()
+go opts = do
 #if 1
     -- Build a tree with comparative meta information
     (tree :: Tree (FilePath, (Set FileAttribute, Set FileAttribute))) <-
-        zipFolderFiles verbosity (\a b -> return (a, b)) left right
+        zipFolderFiles (view verbosity opts) (\a b -> return (a, b)) (view left opts) (view right opts)
     -- Get additional information where there are corresponding file
+    when (view verbosity opts >= 1) $ liftIO $ putStrLn $
+      "Number of regular files to read: " ++
+        show (2 * (length (Prelude.filter (\(_, (lattrs, rattrs)) -> Set.member Regular lattrs && Set.member Regular rattrs) (flatten tree))))
     (tree' :: Tree (FilePath, Set FileComparison)) <-
         unfoldTreeM (\(Node (path, (lattrs, rattrs)) subforest) ->
                          if (Set.member Regular lattrs && Set.member Regular rattrs)
                          then do
-                           lattrs' <- getDeeper verbosity (left </> path) lattrs
-                           rattrs' <- getDeeper verbosity (right </> path) rattrs
-                           when (verbosity >= 2) (liftIO $ putStrLn ("lattrs' " ++ path ++ ": " ++ show lattrs'))
-                           when (verbosity >= 2) (liftIO $ putStrLn ("rattrs' " ++ path ++ ": " ++ show rattrs'))
+                           lattrs' <- getDeeper (view verbosity opts) (view left opts </> path) lattrs
+                           rattrs' <- getDeeper (view verbosity opts) (view right opts </> path) rattrs
+                           when (view verbosity opts >= 2) (liftIO $ putStrLn ("lattrs' " ++ path ++ ": " ++ show lattrs'))
+                           when (view verbosity opts >= 2) (liftIO $ putStrLn ("rattrs' " ++ path ++ ": " ++ show rattrs'))
                            let attrs = compareFiles lattrs' rattrs'
-                           when (verbosity >= 2) (liftIO $ putStrLn ("attrs " ++ path ++ ": " ++ show attrs))
+                           when (view verbosity opts >= 2) (liftIO $ putStrLn ("attrs " ++ path ++ ": " ++ show attrs))
                            return $ ((path, attrs), subforest)
                          else return $ ((path, compareFiles lattrs rattrs), subforest)) tree
-    when (verbosity >= 3) (liftIO $ putStrLn (show tree'))
+    when (view verbosity opts >= 3) (liftIO $ putStrLn (show tree'))
     let pairs = flatten tree'
     liftIO $ do
       putStrLn ("# files: " ++ show (length pairs))
