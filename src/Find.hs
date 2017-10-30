@@ -6,9 +6,11 @@ module Find
     , Sum
     , FileAttribute(..), toSum, isRegular
     , FileComparison(..)
+    , compareFolders
     , zipFolderFiles
     , compareFiles
     , makeLengthMap
+    , findDuplicateFiles
     , makeChecksumMap
     , keepDuplicates
     , keepRegular
@@ -21,6 +23,7 @@ module Find
 
 import Control.Exception (throw, try)
 import Control.Monad (when)
+import Control.Monad.State (evalStateT)
 import Data.ByteString as BS (ByteString, isPrefixOf, readFile, take)
 import Data.ByteString.Lazy (fromStrict)
 #if 0
@@ -29,11 +32,11 @@ import Data.Digest.Pure.SHA
 import Data.Digest.Pure.MD5
 #endif
 import Data.List (intercalate)
-import Data.Map.Strict as Map (delete, elems, filter, fromList, fromListWith, lookup, Map, size, toList)
+import Data.Map.Strict as Map (delete, elems, filter, fromList, fromListWith, lookup, Map, size, toList, unionsWith)
 import Data.Maybe (catMaybes, listToMaybe)
 import Data.Set as Set (empty, fromList, insert, map, member, Set, singleton, size, toList, union, unions)
 import Data.Tree
-import System.Directory (getDirectoryContents)
+import System.Directory (canonicalizePath, getDirectoryContents)
 import System.Posix.Files (fileSize, getSymbolicLinkStatus, isDirectory, isRegularFile, isSymbolicLink, modificationTime)
 import System.Posix.Types (EpochTime, FileOffset)
 import System.FilePath ((</>))
@@ -104,6 +107,57 @@ checksum :: ByteString -> Sum
 checksum = md5 . fromStrict
 #endif
 
+{- The idea of "folding" in haskell seems pretty straightforward - you
+   give it an a, and some functions to apply to the different pieces of
+   an a to make an r, and the fold applies the appropriate function or
+   functions to create a result:
+
+     foldr :: (a -> r -> r) -> r -> t a -> r
+
+   Unfolding, on the other hand, is much more slippery.  Presumably it
+   is the inverse operation to folding, so it takes a "result" r and
+   builds an a.  First problem is that the word "unfold" makes me think
+   of the exact opposite.  In my mind, the "unfold" operation for a tree
+   is going to give me something other than a tree.  But in Haskell world
+   doing a Tree unfold is what builds you a Tree.  So lets look:
+
+     unfoldTree :: (b -> (a, [b])) -> b -> Tree a
+     unfoldTreeM :: Monad m => (b -> m (a, [b])) -> b -> m (Tree a)
+
+   This is clearly going to turn a @b@ into a @Tree a@, and it is going to
+   use a function parameter that turns any @b@ into an @a@ (a node label) and
+   a list of @b@, which presumably represent the tree's children. -}
+
+-- | Do a deep comparison of the contents of two folders.
+compareFolders :: (MonadIO m, MonadState St m) => Int -> FilePath -> FilePath -> m (Tree (FilePath, Set FileComparison))
+compareFolders verbosity left0 right0 = do
+  left <- liftIO $ canonicalizePath left0
+  right <- liftIO $ canonicalizePath right0
+  if left == right
+  then (error $ "Cannot compare a directory to itself: " ++ show left0 ++ ", " ++ show right0)
+  else do
+    -- Build a tree with comparative meta information
+    (tree :: Tree (FilePath, (Set FileAttribute, Set FileAttribute))) <-
+        zipFolderFiles verbosity (\a b -> return (a, b)) left right
+    -- Get additional information where there are corresponding file
+    when (verbosity >= 1) $ liftIO $ putStrLn $
+      "Number of regular files to read: " ++
+        show (2 * (length (Prelude.filter (\(_, (lattrs, rattrs)) -> Set.member Regular lattrs && Set.member Regular rattrs) (flatten tree))))
+    (tree' :: Tree (FilePath, Set FileComparison)) <-
+        unfoldTreeM (\(Node (path, (lattrs, rattrs)) subforest) ->
+                         if (Set.member Regular lattrs && Set.member Regular rattrs)
+                         then do
+                           lattrs' <- getDeeper verbosity (left </> path) lattrs
+                           rattrs' <- getDeeper verbosity (right </> path) rattrs
+                           when (verbosity >= 2) (liftIO $ putStrLn ("lattrs' " ++ path ++ ": " ++ show lattrs'))
+                           when (verbosity >= 2) (liftIO $ putStrLn ("rattrs' " ++ path ++ ": " ++ show rattrs'))
+                           let attrs = compareFiles lattrs' rattrs'
+                           when (verbosity >= 2) (liftIO $ putStrLn ("attrs " ++ path ++ ": " ++ show attrs))
+                           return $ ((path, attrs), subforest)
+                         else return $ ((path, compareFiles lattrs rattrs), subforest)) tree
+    when (verbosity >= 3) (liftIO $ putStrLn (show tree'))
+    return tree'
+
 -- | Traverse two folders and collect information about the
 -- corresponding files at corresponding subpaths.
 zipFolderFiles ::
@@ -164,12 +218,18 @@ getDeeper _verbosity path attrs = do
                   (\bytes -> Set.insert (Bytes bytes) ({-Set.insert (Checksum ck)-} attrs))
                   content
 
+-- | Use a state monad to output message whenever the lens
+-- state value reaches a multiple of count.
 doDots :: (MonadIO m, MonadState St m) => Int -> String -> Lens' St Int -> m ()
-doDots c s l = do
-  l %= succ
-  n <- use l
-  when (n `mod` c == 0) (liftIO $ hPutStr stderr (show n ++ " " ++ s ++ "..."))
+doDots count message lens = do
+  lens %= succ
+  n <- use lens
+  when (n `mod` count == 0) (liftIO $ hPutStr stderr (show n ++ " " ++ message ++ "..."))
 
+-- | Retrieve all the files within a directory using the supplied get
+-- function (typically 'getStatus' or getStatusDeep') and then apply
+-- @f@ to the retrieved attributes.  This is to avoid the collection
+-- of enormous quantities of data during the traversal.
 getSubdirectoryFilesRecursive ::
     forall m a. (MonadIO m, MonadState St m, Show a)
     => Int
@@ -196,6 +256,17 @@ getSubdirectoryFilesRecursive verbosity get f top =
           True -> (fmap (path </>) . Prelude.filter (`notElem` [".", ".."])) <$> liftIO (getDirectoryContents path)
           False -> return []
 
+findDuplicateFiles :: (MonadIO m, MonadState St m) => Int -> [FilePath] -> m (Map (Maybe Sum) (Set FilePath))
+findDuplicateFiles verbosity tops = do
+  when (verbosity >= 1) (liftIO $ putStrLn $ "Searching for duplicate files in " ++ show tops)
+  (trees :: [Map FilePath (Set FileAttribute)]) <- flip evalStateT def $
+              mapM (\top -> getSubdirectoryFilesRecursive verbosity (getStatus verbosity) id top) tops
+  let tree = (Map.unionsWith (\_ _ -> error "unions") trees :: Map FilePath (Set FileAttribute))
+  let lmp = makeLengthMap verbosity tree
+  makeChecksumMap verbosity tree lmp
+
+-- | Given a map of the file attributes and a map of the files
+-- collected by size, build a map from checksum to paths.
 makeChecksumMap ::
     forall m. (MonadIO m, MonadState St m)
     => Int
@@ -225,6 +296,7 @@ makeChecksumMap verbosity attrmap lengthmap = do
       lengthmap' :: Map FileOffset (Set FilePath)
       lengthmap' = Map.filter (\s -> Set.size s > 1) lengthmap
 
+-- | Collect files by size in a map.
 makeLengthMap :: Int -> Map FilePath (Set FileAttribute) -> Map FileOffset (Set FilePath)
 makeLengthMap _verbosity attrmap =
     Map.fromListWith union $ concatMap toPair $ Map.toList attrmap
@@ -235,23 +307,9 @@ makeLengthMap _verbosity attrmap =
 keepDuplicates :: forall k. Ord k => Map k (Set FilePath) -> Map k (Set FilePath)
 keepDuplicates = Map.filter (\s -> Set.size s > 1)
 
+-- | Remove files that are not regular - folders, devices, links, etc..
 keepRegular :: Map FilePath (Set FileAttribute) -> Map FilePath (Set FileAttribute)
 keepRegular = Map.filter (Set.member Regular)
-
-#if 0
-mergeIdenticalFolders :: Map FilePath (Set FileComparison) -> Map FilePath (Set FileComparison)
-mergeIdenticalFolders mp = mp
-
-filePairInfoMap :: FilePath -> FilePath -> IO (Map FilePath (Maybe (Set FileAttribute), Maybe (Set FileAttribute)))
-filePairInfoMap ltop rtop = do
-  (lfiles :: Map FilePath (Set FileAttribute)) <- getSubdirectoryFilesRecursive False ltop
-  (rfiles :: Map FilePath (Set FileAttribute)) <- getSubdirectoryFilesRecursive False rtop
-  return $ Map.unionWith merge (fmap (\x -> (Just x, Nothing)) lfiles) (fmap (\x -> (Nothing, Just x)) rfiles)
-    where
-      merge :: (Maybe (Set FileAttribute), Maybe (Set FileAttribute)) -> (Maybe (Set FileAttribute), Maybe (Set FileAttribute)) -> (Maybe (Set FileAttribute), Maybe (Set FileAttribute))
-      merge (Just ls, Nothing) (Nothing, Just rs) = (Just ls, Just rs)
-      merge _ _ = error "unexpected"
-#endif
 
 isRegular :: Set FileAttribute -> Bool
 isRegular = Set.member Regular
@@ -266,6 +324,7 @@ toLength = listToMaybe . catMaybes . Set.toList . Set.map (\x -> case x of Lengt
 toSum :: Set FileAttribute -> Maybe Sum
 toSum = fmap checksum . toBytes
 
+-- | Use two sets of file attributes to generate the comparison set.
 compareFiles :: Set FileAttribute -> Set FileAttribute -> Set FileComparison
 compareFiles lattrs rattrs =
   Set.unions [doExists, doRegular, doFolders, doLength, doPrefix, doUnreadable, doAge]
