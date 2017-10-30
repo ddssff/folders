@@ -1,4 +1,4 @@
-{-# LANGUAGE CPP, FlexibleContexts, RankNTypes, ScopedTypeVariables, TemplateHaskell, TupleSections #-}
+{-# LANGUAGE CPP, FlexibleContexts, FlexibleInstances, RankNTypes, ScopedTypeVariables, TemplateHaskell, TupleSections #-}
 {-# OPTIONS -Wall #-}
 
 module Find
@@ -57,6 +57,12 @@ $(makeLenses ''St)
 
 instance Default St where def = St 0 0
 
+class IsFolder a where
+    isFolder :: a -> Bool
+
+instance IsFolder (Set FileAttribute) where
+    isFolder = Set.member Folder
+
 data FileAttribute
     = Nonexistant
     | Unreadable
@@ -64,10 +70,10 @@ data FileAttribute
     | Folder
     | Link
     | Other
-    -- These should be computed only if necessary, and removed from the
-    -- Set ASAP to avoid using vast amounts of RAM.
     | Length FileOffset
     | ModTime EpochTime
+    -- This should be computed only if necessary, and removed from the
+    -- Set ASAP to avoid using vast amounts of RAM.
     | Bytes ByteString
     -- | Checksum Sum
     deriving (Eq, Ord)
@@ -138,7 +144,7 @@ compareFolders verbosity left0 right0 = do
   else do
     -- Build a tree with comparative meta information
     (tree :: Tree (FilePath, (Set FileAttribute, Set FileAttribute))) <-
-        zipFolderFiles verbosity (\a b -> return (a, b)) left right
+        zipFolderFiles verbosity (getStatus verbosity) (\a b -> return (a, b)) left right
     -- Get additional information where there are corresponding file
     when (verbosity >= 1) $ liftIO $ putStrLn $
       "Number of regular files to read: " ++
@@ -161,23 +167,24 @@ compareFolders verbosity left0 right0 = do
 -- | Traverse two folders and collect information about the
 -- corresponding files at corresponding subpaths.
 zipFolderFiles ::
-       (MonadIO m, MonadState St m)
+       (IsFolder attributes, Show attributes, MonadIO m, MonadState St m)
     => Int
-    -> (Set FileAttribute -> Set FileAttribute -> m a)
+    -> (FilePath -> m attributes)
+    -> (attributes -> attributes -> m a)
     -> FilePath
     -> FilePath
     -> m (Tree (FilePath, a))
-zipFolderFiles verbosity fn ltop rtop =
+zipFolderFiles verbosity get fn ltop rtop =
     work ""
     where
       work sub = do
-        lattrs <- getStatus verbosity (ltop </> sub)
-        rattrs <- getStatus verbosity (rtop </> sub)
+        lattrs <- get (ltop </> sub)
+        rattrs <- get (rtop </> sub)
         when (verbosity >= 2) $ do
           liftIO $ do
             putStrLn ("lattrs " ++ sub ++ ": " ++ show lattrs)
             putStrLn ("rattrs " ++ sub ++ ": " ++ show rattrs)
-        sf <- case (Set.member Folder lattrs, Set.member Folder rattrs) of
+        sf <- case (isFolder lattrs, isFolder rattrs) of
           (True, True) -> do
             (lsubs :: Set FilePath) <- (Set.fromList . fmap (sub </>)) <$> listDirectory (ltop </> sub)
             (rsubs :: Set FilePath) <- (Set.fromList . fmap (sub </>)) <$> listDirectory (rtop </> sub)
@@ -231,10 +238,10 @@ doDots count message lens = do
 -- @f@ to the retrieved attributes.  This is to avoid the collection
 -- of enormous quantities of data during the traversal.
 getSubdirectoryFilesRecursive ::
-    forall m a. (MonadIO m, MonadState St m, Show a)
+    forall m a attributes. (IsFolder attributes, MonadIO m, MonadState St m, Show a)
     => Int
-    -> (FilePath -> m (Set FileAttribute)) -- ^ Must at least determine if path is a 'Folder'
-    -> (Set FileAttribute -> a)
+    -> (FilePath -> m attributes) -- ^ Must at least determine if path is a 'Folder'
+    -> (attributes -> a)
     -> FilePath
     -> m (Map FilePath a)
 getSubdirectoryFilesRecursive verbosity get f top =
@@ -250,10 +257,10 @@ getSubdirectoryFilesRecursive verbosity get f top =
         subfiles <- concat <$> mapM (getSubdirectoryFilesRecursive') subpaths
         return $ (path, f attrs) : subfiles
 
-      getSubdirectoryFiles :: (MonadIO m, MonadState St m) => FilePath -> Set FileAttribute -> m [FilePath]
+      getSubdirectoryFiles :: (MonadIO m, MonadState St m) => FilePath -> attributes -> m [FilePath]
       getSubdirectoryFiles path attrs = do
-        case Set.member Folder attrs of
-          True -> (fmap (path </>) . Prelude.filter (`notElem` [".", ".."])) <$> liftIO (getDirectoryContents path)
+        case isFolder attrs of
+          True -> fmap (path </>) <$> listDirectory path
           False -> return []
 
 findDuplicateFiles :: (MonadIO m, MonadState St m) => Int -> [FilePath] -> m (Map (Maybe Sum) (Set FilePath))
